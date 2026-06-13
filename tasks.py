@@ -85,6 +85,7 @@ async def process_company_once(company_id: int) -> dict:
     )"""
 
     trains = detailed_obj.get("trains_available")
+    advertising = detailed_obj.get("advertising_budget")
     funds = detailed_obj.get("company_funds")
     hired = company_obj.get("employees_hired")
     cap = company_obj.get("employees_capacity")
@@ -103,6 +104,7 @@ async def process_company_once(company_id: int) -> dict:
         "capacity": cap,
         "new_news_count": len(news_obj),
         "employees_count": len(employees_obj),
+        "advertising": advertising,
     }
 
 
@@ -168,16 +170,22 @@ async def run_inactivity_alerts(bot, company_id: int):
                 to_alert.append((emp_id, name, rel, hrs, label))
         if not to_alert:
             continue
-        title = {1: "Inactivity Alert — 18h (Ping)",
-                 2: "Inactivity Warning — 24h",
-                 3: "Inactivity 2nd Last Warning — 48h"}[level]
+        title = {
+                1: f"{company['name']} [{company_id}] — Inactivity Alert — 18h",
+                2: f"{company['name']} [{company_id}] — Inactivity Warning — 24h",
+                3: f"{company['name']} [{company_id}] — Inactivity Final Warning — 48h",
+            }[level]
+        #alerts = (f"{company['name']} | Company ID: {company_id}\n Inactivity and Addiction Alerts\n")
         pretty = []
+        #pretty.append(alerts)
         for emp_id, name, rel, hrs, _ in to_alert:
             link = await get_member_link_by_torn_id(emp_id)
             mention = f"<@{link['discord_id']}>" if link else f"**{name}**"
             pretty.append(f"• {mention} — {rel}")
-        await channel.send(f"**{title}**\n" + "\n".join(pretty))
-
+        if pretty:
+            await channel.send(f"**{title}**\n" + "\n".join(pretty))
+        else:
+            print("No pretty lines to send for inactivity alert, skipping message.")
 
 async def infer_addiction_value(user_payload: dict) -> Optional[float]:
     """
@@ -245,6 +253,7 @@ async def run_addiction_check(bot, company_id: int):
     
     cooldown_secs = ADDICTION_COOLDOWN_DAYS * 86400
     now = int(time.time())
+    title = f"{company['name']} [{company_id}] — Addiction Alert\nThreshold: {min_thr} "
 
     to_alert_ids, to_reset_ids = [], []
     for uid, val in addiction_of.items():
@@ -282,7 +291,7 @@ async def run_addiction_check(bot, company_id: int):
             # Update state
             await set_addiction_flag(company_id, uid, True)
             #await set_addiction_last(company_id, uid, val_int, now)
-        title = f"Addiction Alert — Threshold {min_thr}"
+        #title1 = f"Addiction Alert — Threshold {min_thr}"
         await channel.send(f"**{title}**\n" + "\n".join(pretty))
     for uid in to_reset_ids:
         await set_addiction_flag(company_id, uid, False, last_value=None, last_ts=None)

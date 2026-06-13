@@ -170,6 +170,8 @@ CREATE TABLE IF NOT EXISTS company_metrics_history (
   company_funds INTEGER,
   company_bank INTEGER,
   value INTEGER,
+  rating INTEGER,
+  advertising_budget INTEGER,
   PRIMARY KEY (company_id, ts)
 );
 
@@ -248,7 +250,9 @@ async def init_db():
         await _ensure_column(db, "company_thresholds", "addiction_threshold", "INTEGER DEFAULT 1")
         await _ensure_column(db, "alert_state", "addiction_last_value", "INTEGER")
         await _ensure_column(db, "alert_state", "addiction_last_ts", "INTEGER")
-
+        await _ensure_column(db, "company_metrics_history", "rating", "INTEGER")
+        #await _ensure_column(db, "company_profile", "advertising_budget", "INTEGER DEFAULT 0")
+        await _ensure_column(db, "company_metrics_history", "advertising_budget", "INTEGER DEFAULT 0")
         await db.commit()
 
 # ---------- Tracker settings (daily snapshot sections + stock rules) ----------
@@ -861,15 +865,15 @@ async def insert_company_metrics_snapshot(company_id: int, profile: dict | None,
         await db.execute("""
         INSERT OR IGNORE INTO company_metrics_history
         (company_id, ts, employees_hired, employees_capacity, daily_income, daily_customers, weekly_income, weekly_customers,
-         popularity, efficiency, environment, trains_available, company_funds, company_bank, value)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         popularity, efficiency, environment, trains_available, company_funds, company_bank, value, rating, advertising_budget)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             company_id, now,
             p.get("employees_hired"), p.get("employees_capacity"),
             p.get("daily_income"), p.get("daily_customers"),
             p.get("weekly_income"), p.get("weekly_customers"),
             d.get("popularity"), d.get("efficiency"), d.get("environment"),
-            d.get("trains_available"), d.get("company_funds"), d.get("company_bank"), d.get("value")
+            d.get("trains_available"), d.get("company_funds"), d.get("company_bank"), d.get("value"), p.get("rating"), d.get("advertising_budget")
         ))
         await db.commit()
 
@@ -1003,3 +1007,12 @@ async def get_recent_news(company_id: int, since_ts: int):
             ORDER BY timestamp DESC
         """, (company_id, since_ts))
         return [dict(r) for r in await cur.fetchall()]
+
+async def get_company_total_wages(company_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COALESCE(SUM(COALESCE(wage,0)),0) FROM employees WHERE company_id = ?",
+            (int(company_id),)
+        )
+        (total,) = await cur.fetchone()
+        return int(total or 0)

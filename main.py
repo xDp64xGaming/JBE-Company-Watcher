@@ -49,11 +49,12 @@ async def start_company_task(company_id: int):
             try:
                 await process_company_once(company_id)
                 stock_alerts = await check_stock_rules_for_company(company_id)
+                company = await get_company(company_id)
+                channel_id = company.get("alert_channel_id") if company else None
+                channel = bot.get_channel(int(channel_id)) if channel_id else None
 
                 if stock_alerts:
-                    company = await get_company(company_id)
-                    channel_id = company.get("alert_channel_id") if company else None
-                    channel = bot.get_channel(int(channel_id)) if channel_id else None
+                    
 
                     if channel:
                         await channel.send(
@@ -62,6 +63,7 @@ async def start_company_task(company_id: int):
                 now = asyncio.get_event_loop().time()
 
                 # Inactivity every 6h
+                #await channel.send(f"{company['name']} | Company ID: {company_id}\n Inactivity and Addiction Alerts\n")
                 if now - last_inact >= INACTIVITY_CHECK_SECONDS:
                     await run_inactivity_alerts(bot, company_id)
                     last_inact = now
@@ -395,6 +397,13 @@ async def ensure_position_role(member: discord.Member, company_id: int, position
     except discord.Forbidden:
         pass
 
+def safe_int(value, default=0):
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 async def build_company_report_embeds(company_id: int) -> list[discord.Embed] | None:
     from db import (
@@ -409,15 +418,22 @@ async def build_company_report_embeds(company_id: int) -> list[discord.Embed] | 
     metrics = await get_recent_metrics(company_id, limit=2)
     latest = metrics[0] if metrics else {}
     prev   = metrics[1] if len(metrics) > 1 else {}
+    #print(f"Debug: latest metrics for company {company_id}: {latest}")
+    #print(f"Debug: previous metrics for company {company_id}: {prev}")
 
     name   = comp.get("name") or f"Company {company_id}"
     funds  = latest.get("company_funds")
     bank   = latest.get("company_bank")
     trains = latest.get("trains_available")
+    advertising = safe_int(latest.get("advertising_budget"))
     val    = latest.get("value")
     pop, eff, env = latest.get("popularity"), latest.get("efficiency"), latest.get("environment")
     hired = latest.get("employees_hired")
     cap   = latest.get("employees_capacity")
+    rating = latest.get("rating")
+    total_wages = safe_int(await get_company_total_wages(company_id))
+    daily_income = safe_int(latest.get("daily_income"))
+    profit_est = daily_income - total_wages - advertising
 
     def fmt(n):
         return f"{n:,}" if isinstance(n, (int, float)) and n is not None else "—"
@@ -431,13 +447,18 @@ async def build_company_report_embeds(company_id: int) -> list[discord.Embed] | 
 
     e1 = discord.Embed(
         title=f"{name} — Daily Snapshot",
-        description=f"`{company_id}`",
+        description=f"**{rating}** :star:| `{company_id}`",
         colour=discord.Colour.blurple()
     )
+    e1.add_field(name='Daily Income ', value=f"${fmt(daily_income)}", inline=False)
+    e1.add_field(name="Advertising", value=f"${advertising:,}", inline=True)
     e1.add_field(name="Funds / Bank", value=f"${fmt(funds)}{d(funds, prev.get('company_funds'))}  |  ${fmt(bank)}{d(bank, prev.get('company_bank'))}", inline=False)
     e1.add_field(name="Value / Trains", value=f"${fmt(val)}  |  {fmt(trains)}", inline=True)
     e1.add_field(name="P/E/E", value=f"{fmt(pop)}/{fmt(eff)}/{fmt(env)}", inline=True)
     e1.add_field(name="Staffing", value=f"{fmt(hired)}/{fmt(cap)}", inline=True)
+
+    e1.add_field(name="Total Wages", value=f"${total_wages:,}", inline=True)
+    e1.add_field(name="Profit (est.)", value=f"${profit_est:,}", inline=True)
 
     # Stock (cached current)
     stock = await get_current_stock(company_id)
@@ -635,25 +656,7 @@ async def list_companies(interaction: discord.Interaction):
         desc.append(line)
     await interaction.response.send_message("\n".join(desc), ephemeral=True)
 
-@bot.tree.command(name="refresh_now", description="Force a refresh for a company and show a short summary.")
-@app_commands.describe(company_id="Torn company ID")
-async def refresh_now(interaction: discord.Interaction, company_id: int):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        summary = await process_company_once(company_id)
-    except Exception as e:
-        await interaction.followup.send(f"Error: {e}", ephemeral=True)
-        return
 
-    msg = (
-        f"**{summary.get('name') or 'Unknown'}** (`{company_id}`)\n"
-        f"• Employees: {summary['employees_count']}\n"
-        f"• Trains: {summary.get('trains')}\n"
-        f"• Funds: {summary.get('funds')}\n"
-        f"• Staffed: {summary.get('hired')}/{summary.get('capacity')}\n"
-        f"• News entries this pull: {summary.get('new_news_count')}"
-    )
-    await interaction.followup.send(msg, ephemeral=True)
 
 @bot.tree.command(name="get_employees", description="Show cached employees for a company (first 20).")
 @app_commands.describe(company_id="Torn company ID")
@@ -1325,21 +1328,117 @@ async def reset_addiction_flags_cmd(
         ephemeral=True
     )
 
-@bot.tree.command(name="company_report_now", description="Post the daily company report now.")
-@app_commands.describe(company_id="Torn company ID")
+@bot.tree.command(
+    name="refresh_now",
+    description="Force refresh one company or all companies, then run alerts/report."
+)
+@app_commands.describe(
+    company_id="Torn company ID. Leave empty if using all_companies.",
+    all_companies="Refresh every tracked company.",
+    send_alerts="Run stock, inactivity, and addiction alerts after refreshing.",
+    send_report="Post the company report after refreshing."
+)
 @app_commands.checks.has_permissions(manage_guild=True)
-async def company_report_now(interaction: discord.Interaction, company_id: int):
+async def refresh_now(
+    interaction: discord.Interaction,
+    company_id: int | None = None,
+    all_companies: bool = False,
+    send_alerts: bool = True,
+    send_report: bool = False
+):
     await interaction.response.defer(ephemeral=True)
 
-    await process_company_once(company_id)
+    if all_companies:
+        companies = await get_companies()
+        company_ids = [int(c["company_id"]) for c in companies]
+    else:
+        if company_id is None:
+            await interaction.followup.send(
+                "Please provide `company_id` or set `all_companies=true`.",
+                ephemeral=True
+            )
+            return
 
-    ok = await post_company_daily_report(bot, company_id, mark_news_seen=False)
+        if not await get_company(company_id):
+            await interaction.followup.send("Company not found.", ephemeral=True)
+            return
 
-    if not ok:
-        await interaction.followup.send("Could not post report (missing channel or data).", ephemeral=True)
+        company_ids = [int(company_id)]
+
+    if not company_ids:
+        await interaction.followup.send("No companies found to refresh.", ephemeral=True)
         return
 
-    await interaction.followup.send("✅ Report posted.", ephemeral=True)
+    lines = []
+
+    for cid in company_ids:
+        try:
+            result = await refresh_company_full(
+                bot,
+                cid,
+                send_alerts=send_alerts,
+                send_report=send_report
+            )
+
+            lines.append(
+                f"✅ **{result['name']}** [`{cid}`]\n"
+                f"• Fresh data pulled\n"
+                f"• Alerts checked: {'Yes' if result['alerts_checked'] else 'No'}\n"
+                f"• Stock alerts sent: {result['stock_alerts']}\n"
+                f"• Report posted: {'Yes' if result['report_posted'] else 'No'}"
+            )
+
+        except Exception as e:
+            lines.append(f"❌ Company `{cid}` failed: `{e}`")
+
+        await asyncio.sleep(1.5)
+
+    await interaction.followup.send("\n\n".join(lines)[:1900], ephemeral=True)
+
+
+async def refresh_company_full(
+    bot: commands.Bot,
+    company_id: int,
+    *,
+    send_alerts: bool = True,
+    send_report: bool = False
+) -> dict:
+    summary = await process_company_once(company_id)
+
+    company = await get_company(company_id)
+    company_name = company.get("name") or summary.get("name") or f"Company {company_id}"
+
+    results = {
+        "company_id": company_id,
+        "name": company_name,
+        "refreshed": True,
+        "stock_alerts": 0,
+        "alerts_checked": False,
+        "report_posted": False,
+    }
+
+    if send_alerts:
+        stock_alerts = await check_stock_rules_for_company(company_id)
+
+        channel_id = company.get("alert_channel_id") if company else None
+        channel = bot.get_channel(int(channel_id)) if channel_id else None
+
+        if stock_alerts and channel:
+            await channel.send(
+                f"**📦 {company_name} [{company_id}] — Stock Alert**\n"
+                + "\n".join(stock_alerts[:20])
+            )
+            results["stock_alerts"] = len(stock_alerts)
+
+        await run_inactivity_alerts(bot, company_id)
+        await run_addiction_check(bot, company_id)
+        results["alerts_checked"] = True
+
+    if send_report:
+        ok = await post_company_daily_report(bot, company_id, mark_news_seen=False)
+        results["report_posted"] = bool(ok)
+
+    return results
 
 from discord import app_commands
 import discord
