@@ -68,9 +68,21 @@ async def process_company_once(company_id: int) -> dict:
         await upsert_employees(company_id, employees_obj)
 
     # NEWS
-    news_obj = (bundle.get("news") or {})
+    news_payload = bundle.get("news") or {}
+
+    news_obj = (
+        news_payload.get("company_news")
+        or news_payload.get("news")
+        or {}
+    )
+
     if news_obj:
         await upsert_news(company_id, news_obj)
+
+    """print(
+        f"Processed company {company_id}: profile {'found' if company_obj else 'missing'}, "
+        f"News entries: {len(news_obj)}"
+    )"""
 
     trains = detailed_obj.get("trains_available")
     funds = detailed_obj.get("company_funds")

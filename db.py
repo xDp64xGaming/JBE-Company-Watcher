@@ -392,19 +392,6 @@ async def update_employee_addiction(employee_id: int, addiction_value: float | N
         )
         await db.commit()
 
-async def upsert_news(company_id: int, news_map: dict):
-    async with aiosqlite.connect(DB_PATH) as db:
-        for news_id, obj in (news_map or {}).items():
-            await db.execute("""
-            INSERT INTO company_news (id, company_id, news_text, timestamp, seen)
-            VALUES (?, ?, ?, ?, COALESCE((SELECT seen FROM company_news WHERE id = ?), 0))
-            ON CONFLICT(id) DO UPDATE SET
-              company_id=excluded.company_id,
-              news_text=excluded.news_text,
-              timestamp=excluded.timestamp
-            """, (news_id, company_id, obj.get("news"), obj.get("timestamp"), news_id))
-        await db.commit()
-
 async def get_employees_by_company(company_id: int, limit: int | None = None):
     sql = "SELECT * FROM employees WHERE company_id = ? ORDER BY name COLLATE NOCASE"
     if limit:
@@ -428,12 +415,56 @@ async def get_unseen_news(company_id: int):
                                (company_id,))
         return [dict(r) for r in await cur.fetchall()]
 
-async def mark_news_seen(ids: list[str]):
+async def upsert_news(company_id: int, news_map: dict):
+    if not news_map:
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        for news_id, obj in news_map.items():
+            if not isinstance(obj, dict):
+                continue
+
+            news_text = obj.get("news") or obj.get("news_text")
+            ts = obj.get("timestamp")
+
+            if not news_text or ts is None:
+                continue
+
+            await db.execute("""
+            INSERT INTO company_news (id, company_id, news_text, timestamp, seen)
+            VALUES (?, ?, ?, ?, COALESCE((SELECT seen FROM company_news WHERE id = ?), 0))
+            ON CONFLICT(id) DO UPDATE SET
+              company_id = excluded.company_id,
+              news_text = excluded.news_text,
+              timestamp = excluded.timestamp
+            """, (str(news_id), company_id, news_text, int(ts), str(news_id)))
+
+        await db.commit()
+
+async def mark_news_seen(company_id: int, ids: list[str]):
+    clean_ids = [str(i) for i in ids if i]
+
+    if not clean_ids:
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            """
+            UPDATE company_news
+            SET seen = 1
+            WHERE company_id = ?
+              AND id = ?
+            """,
+            [(company_id, news_id) for news_id in clean_ids]
+        )
+        await db.commit()
+
+"""async def mark_news_seen(company_id: int,ids: list[str]):
     if not ids:
         return
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executemany("UPDATE company_news SET seen = 1 WHERE id = ?", [(i,) for i in ids])
-        await db.commit()
+        await db.commit()"""
 
 # ----- alert state -----
 async def get_alert_state(company_id: int, employee_id: int) -> dict:
@@ -851,3 +882,16 @@ async def set_last_report_date(company_id: int, ymd: str):
         ON CONFLICT(company_id) DO UPDATE SET last_report_date = excluded.last_report_date
         """, (company_id, ymd))
         await db.commit()
+
+async def get_recent_news(company_id: int, since_ts: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT *
+            FROM company_news
+            WHERE company_id = ?
+              AND timestamp IS NOT NULL
+              AND timestamp >= ?
+            ORDER BY timestamp DESC
+        """, (company_id, since_ts))
+        return [dict(r) for r in await cur.fetchall()]

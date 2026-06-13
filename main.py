@@ -6,6 +6,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from datetime import datetime
+import re
 
 from db import * #init_db, upsert_company, get_companies, get_company, get_employees_by_company
 from tasks import * #company_loop, process_company_once, run_inactivity_alerts, run_addiction_check, INACTIVITY_CHECK_SECONDS, ADDICTION_CHECK_SECONDS
@@ -84,6 +85,69 @@ async def on_ready():
     # Start one verifier loop per guild
     for g in bot.guilds:
         asyncio.create_task(verifier_loop_for_guild(g))
+
+def is_training_news(text: str) -> bool:
+    text = (text or "").lower()
+
+    training_phrases = [
+        "trained",
+        "train",
+        "trains",
+        "was trained",
+        "received a train",
+        "used a train",
+    ]
+
+    return any(p in text for p in training_phrases)
+
+
+def clean_news_text(text: str) -> str:
+    text = text or ""
+    text = re.sub(r"<a[^>]*>([^<]+)</a>", r"\1", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return text.strip()
+
+
+def make_news_lines(rows: list[dict], limit: int = 10) -> list[str]:
+    lines = []
+
+    for n in rows[:limit]:
+        ts = n.get("timestamp")
+        if ts is None:
+            continue
+
+        text = clean_news_text(n.get("news_text") or n.get("news") or "")
+
+        if not text:
+            continue
+
+        lines.append(f"• {text}\n<t:{int(ts)}:R>")
+
+    if len(rows) > limit:
+        lines.append(f"… and {len(rows) - limit} more")
+
+    return lines
+
+TRAINING_RE = re.compile(
+    r'(?P<name>.+?) has been trained(?: by the director)?',
+    re.IGNORECASE
+)
+
+def is_training_news(text: str) -> bool:
+    return bool(TRAINING_RE.search(clean_news_text(text)))
+
+def parse_training_name(text: str) -> str | None:
+    text = clean_news_text(text)
+    m = TRAINING_RE.search(text)
+    if not m:
+        return None
+    return m.group("name").strip()
+
+def clean_news_text(text: str) -> str:
+    text = text or ""
+    text = re.sub(r"<a[^>]*>([^<]+)</a>", r"\1", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return text.strip()
 
 @bot.event
 async def on_guild_join(guild):
@@ -380,24 +444,61 @@ async def build_company_report_embeds(company_id: int) -> list[discord.Embed] | 
     else:
         e2 = discord.Embed(title=f"{name} — Stock", description="No stock cached yet.", colour=discord.Colour.dark_teal())
 
-    # News (unseen)
-    unseen = await get_unseen_news(company_id)
-    e3 = discord.Embed(title=f"{name} — Company News (new)", colour=discord.Colour.dark_gold())
-    if unseen:
-        lines = []
-        for n in unseen[:MAX_NEWS_ITEMS]:
-            ts = int(n["timestamp"])
-            text = n.get("news") or n.get("news_text") or ""
-            # Basic cleanup of HTML anchors for Discord
-            text = re.sub(r"<a[^>]*>([^<]+)</a>", r"\1", text)
-            lines.append(f"• {text}\n<t:{ts}:R>")
-        if len(unseen) > MAX_NEWS_ITEMS:
-            lines.append(f"… and {len(unseen)-MAX_NEWS_ITEMS} more")
-        e3.add_field(name="\u200b", value="\n\n".join(lines), inline=False)
-    else:
-        e3.description = "No new items."
+        # News — last 7 days, separated into training and other news
+    from db import get_recent_news
 
-    return [e1, e2, e3]
+    seven_days_ago = int(time.time()) - 7 * 86400
+    recent_news = await get_recent_news(company_id, seven_days_ago)
+
+    train_counts = {}
+    other_lines = []
+
+    for n in recent_news:
+        ts = n.get("timestamp")
+        text = clean_news_text(n.get("news_text") or "")
+
+        if not text or ts is None:
+            continue
+
+        trainee = parse_training_name(text)
+
+        if trainee:
+            train_counts[trainee] = train_counts.get(trainee, 0) + 1
+        else:
+            other_lines.append(f"• {text}\n<t:{int(ts)}:R>")
+
+    e3 = discord.Embed(
+        title=f"{name} — Trains Given (last 7 days)",
+        colour=discord.Colour.green()
+    )
+
+    if train_counts:
+        lines = [
+            f"• **{trainee}** has been trained **{count}** time{'s' if count != 1 else ''} by the director."
+            for trainee, count in sorted(train_counts.items(), key=lambda x: (-x[1], x[0].lower()))
+        ]
+        e3.add_field(name="\u200b", value="\n".join(lines[:MAX_NEWS_ITEMS]), inline=False)
+
+        if len(lines) > MAX_NEWS_ITEMS:
+            e3.set_footer(text=f"{len(lines) - MAX_NEWS_ITEMS} more trainees not shown.")
+    else:
+        e3.description = "No train news in the last 7 days."
+
+    e4 = discord.Embed(
+        title=f"{name} — Other Company News (last 7 days)",
+        colour=discord.Colour.dark_gold()
+    )
+
+    if other_lines:
+        e4.add_field(name="\u200b", value="\n\n".join(other_lines[:MAX_NEWS_ITEMS]), inline=False)
+
+        if len(other_lines) > MAX_NEWS_ITEMS:
+            e4.set_footer(text=f"{len(other_lines) - MAX_NEWS_ITEMS} more news items not shown.")
+    else:
+        e4.description = "No other company news in the last 7 days."
+
+    return [e1, e2, e3, e4]
+
 
 
 async def post_company_daily_report(bot: commands.Bot, company_id: int, *, mark_news_seen: bool = True) -> bool:
@@ -1050,110 +1151,51 @@ def _parse_training_news_row(row: dict) -> tuple[int|None, str|None, int]:
         return None, m2.group(1).strip(), ts
     return None, None, ts
 
-@bot.tree.command(name="training_report", description="Condensed training counts from company news.")
+@bot.tree.command(name="training_report", description="Show condensed train history for a company.")
 @app_commands.describe(
     company_id="Torn company ID",
-    days="Only include the last N days (default 7)",
-    member="Optionally filter to a specific Discord member to show their timestamps"
+    days="How many days to look back, default 7"
 )
-async def training_report_cmd(
-    interaction: discord.Interaction,
-    company_id: int,
-    days: int = 7,
-    member: discord.Member | None = None
-):
+async def training_report_cmd(interaction: discord.Interaction, company_id: int, days: int = 7):
     await interaction.response.defer(ephemeral=True)
 
-    from db import get_company
+    from db import get_company, get_recent_news
+
     comp = await get_company(company_id)
     if not comp:
-        await interaction.followup.send("Company not found.", ephemeral=True); return
-
-    # Fetch recent news for this company from DB
-    cutoff = int(time.time()) - max(1, days) * 86400
-    rows: list[dict] = []
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT news_text, timestamp FROM company_news WHERE company_id = ? AND timestamp >= ? ORDER BY timestamp DESC",
-            (company_id, cutoff)
-        )
-        rows = [dict(r) for r in await cur.fetchall()]
-
-    if not rows:
-        await interaction.followup.send("No news in that window.", ephemeral=True); return
-
-    # Build condensed map {employee_id or name: [timestamps]}
-    events_by_key: dict[str, list[int]] = {}
-    id_name_map: dict[str, str] = {}   # key -> display name
-    for r in rows:
-        emp_id, name, ts = _parse_training_news_row(r)
-        if not (emp_id or name):
-            continue
-        key = f"id:{emp_id}" if emp_id else f"name:{name.lower()}"
-        events_by_key.setdefault(key, []).append(ts)
-        if emp_id:
-            id_name_map[key] = f"{name} [{emp_id}]"
-        else:
-            id_name_map[key] = name
-
-    # If filtering by a Discord member, try to map to their Torn ID first
-    limit_to_key = None
-    if member:
-        from db import get_member_link_by_discord, get_employee_by_name_ci
-        link = await get_member_link_by_discord(member.id)
-        if link and link.get("torn_id"):
-            limit_to_key = f"id:{int(link['torn_id'])}"
-        else:
-            # fall back to their (current) name
-            emp = await get_employee_by_name_ci(member.name)
-            if emp:
-                limit_to_key = f"id:{int(emp['employee_id'])}"
-
-    # Compose embed
-    import math
-    e = discord.Embed(
-        title=f"Training Report — Company {company_id} (last {days}d)",
-        colour=discord.Colour.blue()
-    )
-
-    def fmt_ts(ts: int) -> str:
-        return f"<t:{ts}:R>"
-
-    if limit_to_key:
-        stamps = sorted(events_by_key.get(limit_to_key, []), reverse=True)
-        display = id_name_map.get(limit_to_key, "Unknown")
-        if not stamps:
-            await interaction.followup.send(f"No training records found for {member.mention} in the last {days}d.", ephemeral=True)
-            return
-        # show count and the timestamps (cap to ~20)
-        head = f"**{display}** — trained **{len(stamps)}** time(s)"
-        lst = "\n".join([f"• {fmt_ts(s)}" for s in stamps[:20]])
-        if len(stamps) > 20:
-            lst += f"\n… and {len(stamps)-20} more"
-        e.add_field(name=head, value=lst, inline=False)
-        await interaction.followup.send(embed=e, ephemeral=True)
+        await interaction.followup.send("Company not found.", ephemeral=True)
         return
 
-    # Otherwise, show top list condensed per person
-    # Sort by count desc
-    items = sorted(events_by_key.items(), key=lambda kv: len(kv[1]), reverse=True)
-    if not items:
-        await interaction.followup.send("No training events detected in that period.", ephemeral=True); return
+    cutoff = int(time.time()) - max(1, days) * 86400
+    rows = await get_recent_news(company_id, cutoff)
 
-    lines, chars = [], 0
-    for key, stamps in items[:30]:
-        display = id_name_map.get(key, key)
-        ln = f"• **{display}** — {len(stamps)} time(s); last {fmt_ts(max(stamps))}"
-        if chars + len(ln) > 950:
-            e.add_field(name="\u200b", value="\n".join(lines), inline=False)
-            lines, chars = [], 0
-        lines.append(ln); chars += len(ln)+1
-    if lines:
-        e.add_field(name="\u200b", value="\n".join(lines), inline=False)
+    train_counts = {}
+
+    for n in rows:
+        text = n.get("news_text") or ""
+        trainee = parse_training_name(text)
+        if trainee:
+            train_counts[trainee] = train_counts.get(trainee, 0) + 1
+
+    if not train_counts:
+        await interaction.followup.send(f"No train records found in the last {days} days.", ephemeral=True)
+        return
+
+    lines = [
+        f"• **{trainee}** — {count} train{'s' if count != 1 else ''}"
+        for trainee, count in sorted(train_counts.items(), key=lambda x: (-x[1], x[0].lower()))
+    ]
+
+    e = discord.Embed(
+        title=f"Training Report — Company {company_id} — Last {days} Days",
+        description="\n".join(lines[:40]),
+        colour=discord.Colour.green()
+    )
+
+    if len(lines) > 40:
+        e.set_footer(text=f"{len(lines) - 40} more not shown.")
 
     await interaction.followup.send(embed=e, ephemeral=True)
-
 @bot.tree.command(name="db_migrate", description="Run database migrations now (adds missing columns).")
 @discord.app_commands.checks.has_permissions(manage_guild=True)
 async def db_migrate_cmd(interaction: discord.Interaction):
@@ -1277,10 +1319,15 @@ async def reset_addiction_flags_cmd(
 @app_commands.checks.has_permissions(manage_guild=True)
 async def company_report_now(interaction: discord.Interaction, company_id: int):
     await interaction.response.defer(ephemeral=True)
+
+    await process_company_once(company_id)
+
     ok = await post_company_daily_report(bot, company_id, mark_news_seen=False)
+
     if not ok:
         await interaction.followup.send("Could not post report (missing channel or data).", ephemeral=True)
         return
+
     await interaction.followup.send("✅ Report posted.", ephemeral=True)
 
 
