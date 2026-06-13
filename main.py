@@ -48,6 +48,17 @@ async def start_company_task(company_id: int):
         while not bot.is_closed():
             try:
                 await process_company_once(company_id)
+                stock_alerts = await check_stock_rules_for_company(company_id)
+
+                if stock_alerts:
+                    company = await get_company(company_id)
+                    channel_id = company.get("alert_channel_id") if company else None
+                    channel = bot.get_channel(int(channel_id)) if channel_id else None
+
+                    if channel:
+                        await channel.send(
+                            "**📦 Stock Alert**\n" + "\n".join(stock_alerts[:20])
+                        )
                 now = asyncio.get_event_loop().time()
 
                 # Inactivity every 6h
@@ -1330,6 +1341,148 @@ async def company_report_now(interaction: discord.Interaction, company_id: int):
 
     await interaction.followup.send("✅ Report posted.", ephemeral=True)
 
+from discord import app_commands
+import discord
+from discord import app_commands
+#from db import get_tracker_by_id, get_company_stock, set_tracker_stock_rule
+
+
+@bot.tree.command(name="stock_rule_set", description="Set a company stock rule.")
+@app_commands.describe(
+    company_id="Torn company ID",
+    item_name="Exact stock item name",
+    low="Alert if in_stock is below this",
+    high="Alert if in_stock is above this"
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def stock_rule_set_cmd(interaction: discord.Interaction, company_id: int, item_name: str, low: int | None = None, high: int | None = None):
+    await interaction.response.defer(ephemeral=True)
+
+    if not await get_company(company_id):
+        await interaction.followup.send("Company not found.", ephemeral=True)
+        return
+
+    if low is None and high is None:
+        await interaction.followup.send("Provide at least `low` or `high`.", ephemeral=True)
+        return
+
+    await set_tracker_stock_rule(company_id, item_name, low, high)
+
+    await interaction.followup.send(
+        f"✅ Stock rule set for **{item_name}** on company `{company_id}`.",
+        ephemeral=True
+    )
+
+
+@stock_rule_set_cmd.autocomplete("item_name")
+async def stock_item_autocomplete(interaction: discord.Interaction, current: str):
+    try:
+        company_id = getattr(interaction.namespace, "company_id", None)
+        if not company_id:
+            return []
+
+        rows = await get_current_stock(int(company_id))
+        names = [r["item_name"] for r in rows if r.get("item_name")]
+
+        cur = (current or "").casefold()
+        if cur:
+            names = [n for n in names if cur in n.casefold()]
+
+        return [app_commands.Choice(name=n, value=n) for n in sorted(set(names))[:25]]
+    except Exception as e:
+        print(f"[autocomplete stock_item] error: {e}")
+        return []
+
+
+async def check_stock_rules_for_company(company_id: int) -> list[str]:
+    rules = await list_company_stock_rules(company_id)
+    stock = await get_current_stock(company_id)
+
+    if not rules or not stock:
+        return []
+
+    stock_by_name = {r["item_name"]: r for r in stock}
+    alerts = []
+
+    for item_name, rule in rules.items():
+        row = stock_by_name.get(item_name)
+
+        if not row:
+            alerts.append(f"⚠️ **{item_name}** — item not found in current stock.")
+            continue
+
+        in_stock = int(row.get("in_stock") or 0)
+        low = rule.get("low")
+        high = rule.get("high")
+
+        if low is not None and in_stock < int(low):
+            alerts.append(f"🔻 **{item_name}** low stock: `{in_stock}` / threshold `{low}`")
+
+        if high is not None and in_stock > int(high):
+            alerts.append(f"🔺 **{item_name}** high stock: `{in_stock}` / threshold `{high}`")
+
+    return alerts
+
+@bot.tree.command(name="stock_rule_remove", description="Remove a per-tracker stock rule.")
+@app_commands.describe(company_id="Company ID", item_name="Exact stock item name")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def stock_rule_remove_cmd(interaction: discord.Interaction, company_id: int, item_name: str):
+    await interaction.response.defer(ephemeral=True)
+    if not await get_company(company_id):
+        await interaction.followup.send("Company not found.", ephemeral=True)
+        return
+    ok = await delete_company_stock_rule(company_id, item_name)
+    if not ok:
+        await interaction.followup.send("Rule not found.", ephemeral=True)
+        return
+
+    await interaction.followup.send(f"✅ Removed stock rule for **{item_name}** on company #{company_id}.", ephemeral=True)
+
+from discord import app_commands
+
+@stock_rule_remove_cmd.autocomplete("item_name")
+async def stock_rule_remove_item_autocomplete(interaction: discord.Interaction, current: str):
+    try:
+        company_id = getattr(interaction.namespace, "company_id", None)
+        if not company_id:
+            return []
+
+        # get rules for this company
+        settings = await get_company_settings(int(company_id))
+        rules = settings.get("stock_rules") or {}
+
+        names = list(rules.keys())
+
+        cur = (current or "").casefold()
+        if cur:
+            names = [n for n in names if cur in n.casefold()]
+
+        names = sorted(names)[:25]
+        return [app_commands.Choice(name=n, value=n) for n in names]
+
+    except Exception as e:
+        print(f"[autocomplete stock_rule_remove] error: {e}")
+        return []
+
+
+@bot.tree.command(name="stock_rules", description="List per-tracker stock rules.")
+@app_commands.describe(company_id="Company ID")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def stock_rules_list_cmd(interaction: discord.Interaction, company_id: int):
+    await interaction.response.defer(ephemeral=True)
+    if not await get_company(company_id):
+        await interaction.followup.send("Company not found.", ephemeral=True)
+        return
+    rules = await list_company_stock_rules(company_id)
+    if not rules:
+        await interaction.followup.send("No stock rules configured for this company.", ephemeral=True)
+        return
+    lines = [f"Stock rules for company #{company_id}:"]
+    for name, rule in rules.items():
+        lo = rule.get("low")
+        hi = rule.get("high")
+        lines.append(f"• **{name}** — low:{lo if lo is not None else '—'} high:{hi if hi is not None else '—'}")
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:

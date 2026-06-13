@@ -210,6 +210,14 @@ CREATE TABLE IF NOT EXISTS employee_last_action_history (
   PRIMARY KEY (employee_id, ts)
 );
 
+CREATE TABLE IF NOT EXISTS tracker_settings (
+  tracker_id INTEGER PRIMARY KEY,
+  daily_sections_json TEXT,
+  stock_rules_json TEXT,
+  updated_ts INTEGER,
+  FOREIGN KEY(tracker_id) REFERENCES company_trackers(tracker_id)
+);
+
 CREATE TABLE IF NOT EXISTS company_report_state (
   company_id INTEGER PRIMARY KEY,
   last_report_date TEXT   -- 'YYYY-MM-DD' in America/Detroit
@@ -242,6 +250,106 @@ async def init_db():
         await _ensure_column(db, "alert_state", "addiction_last_ts", "INTEGER")
 
         await db.commit()
+
+# ---------- Tracker settings (daily snapshot sections + stock rules) ----------
+
+_DEFAULT_DAILY_SECTIONS = {
+    # snapshot numbers
+    "balance": True,
+    "wages": True,
+    "profit": True,
+    # summaries
+    "alerts_summary": True,
+    "stocks": True,
+    # whether this tracker should actually post alert messages
+    "send_inactivity_alerts": True,
+    "send_addiction_alerts": True,
+    "send_stock_alerts": False,
+}
+
+async def get_company_settings(company_id: int) -> dict:
+    """Return tracker settings with defaults.
+
+    Shape:
+      {
+        "daily_sections": {"balance": bool, ...},
+        "stock_rules": {"Item Name": {"low": int|None, "high": int|None}, ...}
+      }
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT daily_sections_json, stock_rules_json FROM tracker_settings WHERE tracker_id = ?", (int(company_id),))
+        row = await cur.fetchone()
+        if not row:
+            return {"daily_sections": dict(_DEFAULT_DAILY_SECTIONS), "stock_rules": {}}
+        daily = {}
+        rules = {}
+        try:
+            daily = json.loads(row["daily_sections_json"] or "{}") or {}
+        except Exception:
+            daily = {}
+        try:
+            rules = json.loads(row["stock_rules_json"] or "{}") or {}
+        except Exception:
+            rules = {}
+
+        merged = dict(_DEFAULT_DAILY_SECTIONS)
+        merged.update({k: bool(v) for k, v in (daily or {}).items()})
+        return {"daily_sections": merged, "stock_rules": rules or {}}
+
+async def _write_company_settings(company_id: int, daily_sections: dict, stock_rules: dict):
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO tracker_settings (tracker_id, daily_sections_json, stock_rules_json, updated_ts)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(tracker_id) DO UPDATE SET
+              daily_sections_json=excluded.daily_sections_json,
+              stock_rules_json=excluded.stock_rules_json,
+              updated_ts=excluded.updated_ts
+            """,
+            (int(company_id), json.dumps(daily_sections or {}), json.dumps(stock_rules or {}), now),
+        )
+        await db.commit()
+
+async def set_company_daily_section(company_id: int, section_key: str, enabled: bool):
+    st = await get_company_settings(company_id)
+    daily = st.get("daily_sections") or {}
+    daily[str(section_key)] = bool(enabled)
+    await _write_company_settings(company_id, daily, st.get("stock_rules") or {})
+
+async def set_tracker_stock_rule(company_id: int, item_name: str, low: int | None, high: int | None):
+    st = await get_company_settings(company_id)
+    rules = st.get("stock_rules") or {}
+    rules.setdefault(str(item_name), {})
+    if low is not None:
+        rules[str(item_name)]["low"] = int(low)
+    if high is not None:
+        rules[str(item_name)]["high"] = int(high)
+    await _write_company_settings(company_id, st.get("daily_sections") or {}, rules)
+
+async def delete_company_stock_rule(company_id: int, item_name: str) -> bool:
+    st = await get_company_settings(company_id)
+    rules = st.get("stock_rules") or {}
+
+    item_key = str(item_name)
+
+    existed = item_key in rules
+
+    if existed:
+        rules.pop(item_key, None)
+        await _write_company_settings(
+            company_id,
+            st.get("daily_sections") or {},
+            rules
+        )
+
+    return existed
+
+async def list_company_stock_rules(company_id: int) -> dict:
+    st = await get_company_settings(company_id)
+    return st.get("stock_rules") or {}
 
 # ----- companies -----
 async def upsert_company(company_id: int, api_key: str, name: str | None = None,
