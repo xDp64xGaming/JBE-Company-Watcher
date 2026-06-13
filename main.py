@@ -690,12 +690,79 @@ async def map_company_role(interaction: discord.Interaction, company_id: int, ro
         asyncio.create_task(immediate_verify_sweep(guild))
 
 
-async def immediate_verify_sweep(guild: discord.Guild):
-    """One-shot verification sweep used after mapping updates."""
+async def immediate_verify_sweep(guild: discord.Guild) -> dict:
+    result = {
+        "checked": 0,
+        "linked_saved": 0,
+        "linked_name": 0,
+        "linked_display_id": 0,
+        "placeholders": 0,
+        "errors": 0,
+    }
+
     try:
+        await guild.chunk(cache=True)
+    except Exception as e:
+        print(f"[verifier] guild.chunk failed: {e}")
+
+    try:
+        members = [m async for m in guild.fetch_members(limit=None)]
+    except Exception as e:
+        print(f"[verifier] fetch_members failed, using cache: {e}")
+        members = list(guild.members)
+
+    print(f"[verifier] immediate sweep for {guild.name} ({len(members)} members)")
+
+    for member in members:
+        if member.bot:
+            continue
+
+        result["checked"] += 1
+
+        try:
+            link = await get_member_link_by_discord(member.id)
+
+            if link and link.get("torn_id") and link.get("company_id"):
+                tid = int(link["torn_id"])
+                emp = await get_employee_by_id(tid)
+
+                if emp:
+                    await set_nick_safe(member, f"{emp['name']} [{tid}]")
+                    await ensure_only_mapped_company_role(member, emp["company_id"], remove_others=True)
+                    await ensure_position_role(member, emp["company_id"], emp.get("position"), remove_other_position_roles=True)
+                    result["linked_saved"] += 1
+                    continue
+
+            if await try_link_by_name(member, member.name):
+                result["linked_name"] += 1
+                continue
+
+            m = NAME_ID_BRACKET.search(member.display_name or "")
+            if m and await try_link_by_torn_id(member, int(m.group(1))):
+                result["linked_display_id"] += 1
+                continue
+
+            if not link:
+                await upsert_member_link(member.id, None, None, None, verified=False)
+                result["placeholders"] += 1
+
+            await asyncio.sleep(0.05)
+
+        except Exception as e:
+            result["errors"] += 1
+            print(f"[verifier] member {member} failed: {e}")
+
+    return result
+
+#async def immediate_verify_sweep(guild: discord.Guild):
+    """One-shot verification sweep used after mapping updates."""
+    """try:
+        print("Attempting to chunk guild members for immediate sweep...")
         await guild.chunk()
     except Exception:
+        print("Chunking failed, proceeding with unchunked members list (may miss some members if the guild is large).")
         pass
+    print("Building members list for immediate sweep...")
     members = list(guild.members)
     print(f"[verifier] immediate sweep for {guild.name} ({len(members)} members)")
     for member in members:
@@ -716,7 +783,7 @@ async def immediate_verify_sweep(guild: discord.Guild):
             continue
         if not link:
             await upsert_member_link(member.id, None, None, None, verified=False)
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)"""
 
 
 @bot.tree.command(name="verify_user", description="Force-verify a Discord member against a Torn ID.")
@@ -800,15 +867,106 @@ async def debug_commands(interaction: discord.Interaction):
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
+resync_running: set[int] = set()
+
 @bot.tree.command(name="resync_all", description="Run an immediate server-wide verify/role sync.")
 @app_commands.checks.has_permissions(manage_roles=True, manage_nicknames=True)
 async def verify_sweep_now(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("Run this in a server.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
-    await immediate_verify_sweep(interaction.guild)
-    await interaction.followup.send("✅ Verification sweep completed for this server.", ephemeral=True)
+
+    guild = interaction.guild
+
+    if guild.id in resync_running:
+        await interaction.response.send_message("A resync is already running for this server.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"✅ Started verification sweep for **{guild.name}**. I’ll post progress in this channel.",
+        ephemeral=True
+    )
+
+    channel = interaction.channel
+    asyncio.create_task(immediate_verify_sweep_background(guild, channel))
+
+async def immediate_verify_sweep_background(guild: discord.Guild, channel: discord.abc.Messageable):
+    resync_running.add(guild.id)
+
+    checked = 0
+    linked_saved = 0
+    linked_name = 0
+    linked_display_id = 0
+    placeholders = 0
+    errors = 0
+
+    try:
+        members = [m for m in guild.members if not m.bot]
+
+        await channel.send(
+            f"🔄 **Verification sweep started**\n"
+            f"Server: **{guild.name}**\n"
+            f"Members found in cache: `{len(members)}`"
+        )
+
+        for member in members:
+            checked += 1
+
+            try:
+                link = await get_member_link_by_discord(member.id)
+
+                if link and link.get("torn_id") and link.get("company_id"):
+                    tid = int(link["torn_id"])
+                    emp = await get_employee_by_id(tid)
+
+                    if emp:
+                        await set_nick_safe(member, f"{emp['name']} [{tid}]")
+                        await ensure_only_mapped_company_role(member, emp["company_id"], remove_others=True)
+                        await ensure_position_role(
+                            member,
+                            emp["company_id"],
+                            emp.get("position"),
+                            remove_other_position_roles=True
+                        )
+                        linked_saved += 1
+                        continue
+
+                if await try_link_by_name(member, member.name):
+                    linked_name += 1
+                    continue
+
+                m = NAME_ID_BRACKET.search(member.display_name or "")
+                if m and await try_link_by_torn_id(member, int(m.group(1))):
+                    linked_display_id += 1
+                    continue
+
+                if not link:
+                    await upsert_member_link(member.id, None, None, None, verified=False)
+                    placeholders += 1
+
+            except Exception as e:
+                errors += 1
+                print(f"[resync_all] Failed for {member}: {e}")
+
+            if checked % 25 == 0:
+                await channel.send(
+                    f"🔄 Resync progress: `{checked}/{len(members)}` checked..."
+                )
+
+            await asyncio.sleep(0.15)
+
+        await channel.send(
+            f"✅ **Verification sweep completed**\n"
+            f"Checked: `{checked}`\n"
+            f"Linked from saved DB: `{linked_saved}`\n"
+            f"Linked by name: `{linked_name}`\n"
+            f"Linked by display ID: `{linked_display_id}`\n"
+            f"Placeholders: `{placeholders}`\n"
+            f"Errors: `{errors}`"
+        )
+
+    finally:
+        resync_running.discard(guild.id)
 
 @bot.tree.command(name="set_thresholds", description="Set inactivity/addiction alert thresholds for a company.")
 @app_commands.describe(
