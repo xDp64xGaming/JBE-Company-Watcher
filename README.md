@@ -59,9 +59,9 @@ Configure stock monitoring and low-stock alerts.
 The command will display all company stock items and allow you to set custom alert amounts for each item.
 
 **Example Uses:**
-- Alert when DVDs fall below 25
-- Alert when Energy Drinks fall below 50
-- Alert when Plushies fall below 10
+- Alert when Clarinets fall below 1,000
+- Alert when Dinner Candles fall below 25,000
+- Alert when Salt fall below 2,500
 
 ---
 
